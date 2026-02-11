@@ -1,15 +1,15 @@
-FROM python:3.9-slim
+FROM python:3.10-slim
 
-# 1. Install FFmpeg (Critical for yt-dlp)
+# 1. Install System Dependencies (FFmpeg is required for yt-dlp)
 RUN apt-get update && \
     apt-get install -y ffmpeg && \
     apt-get clean
 
-# 2. Set up App
+# 2. Setup App
 WORKDIR /app
 COPY requirements.txt .
-RUN pip install -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
-# 3. Run Server
+# 3. Start Server
 CMD ["gunicorn", "-w", "4", "-b", "0.0.0.0:5000", "app:app"]
