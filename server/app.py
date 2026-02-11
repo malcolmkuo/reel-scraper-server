@@ -19,7 +19,7 @@ R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY")
 R2_BUCKET_NAME = os.environ.get("R2_BUCKET_NAME", "reel-scraper-videos")
 R2_PUBLIC_URL = os.environ.get("R2_PUBLIC_URL", "").rstrip("/")
 
-TEAM_PASSWORD = os.environ.get("TEAM_PASSWORD", "airlab_secret_2026")
+TEAM_PASSWORD = os.environ.get("TEAM_PASSWORD", "malithegoat123")
 
 # --- D1 HELPER ---
 D1_BASE_URL = f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/d1/database/{D1_DATABASE_ID}/query"
