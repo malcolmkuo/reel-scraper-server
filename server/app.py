@@ -45,7 +45,7 @@ def add_reel():
         if existing.data:
             return jsonify({"status": "exists", "message": "Reel already in vault"}), 200
 
-        # 2. Extract Metadata (No Thumbnail)
+        # 2. Extract Metadata
         with yt_dlp.YoutubeDL({'quiet': True}) as ydl:
             info = ydl.extract_info(url, download=False)
             
@@ -54,9 +54,13 @@ def add_reel():
             filename = f"{clean_name}.mp4"
             local_path = f"/tmp/{filename}"
 
-            # Prediction Features
+            # --- PREDICTION FEATURES ---
             uploader = info.get('uploader') or info.get('channel') or "Unknown"
-            duration = info.get('duration', 0)
+            
+            # FIX: Force duration to be an Integer (Whole Number)
+            raw_duration = info.get('duration', 0)
+            duration = int(float(raw_duration)) if raw_duration else 0
+            
             description = info.get('description', '') or ''
             upload_date = info.get('upload_date', '') 
             audio_track = info.get('track') or info.get('artist') or "Original Audio"
@@ -87,19 +91,19 @@ def add_reel():
             "added_by": username,
             "language": language,
             
-            # RecSys Features (Minus Thumbnail)
+            # RecSys Features
             "description": description,
             "tags": tags_str,
-            "duration": duration,
+            "duration": duration, # <--- Now safe (int)
             "uploader": uploader,
             "upload_date": upload_date,
             "audio": audio_track,
 
-            # Metrics
-            "likes": info.get('like_count', 0),
-            "views": info.get('view_count', 0),
-            "comments": info.get('comment_count', 0),
-            "shares": info.get('repost_count', 0)
+            # Metrics (Safe Casts)
+            "likes": int(info.get('like_count', 0) or 0),
+            "views": int(info.get('view_count', 0) or 0),
+            "comments": int(info.get('comment_count', 0) or 0),
+            "shares": int(info.get('repost_count', 0) or 0)
         }
         supabase.table("reels").insert(db_data).execute()
 
