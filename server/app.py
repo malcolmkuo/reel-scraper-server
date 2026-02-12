@@ -1,5 +1,6 @@
 import os
 import re
+import tempfile
 import requests
 import boto3
 from flask import Flask, request, jsonify
@@ -54,9 +55,9 @@ s3 = boto3.client(
 )
 
 
-def upload_to_r2(local_path, key):
+def upload_to_r2(local_path, key, content_type="video/mp4"):
     """Upload a file to R2 and return its public URL."""
-    s3.upload_file(local_path, R2_BUCKET_NAME, key, ExtraArgs={"ContentType": "video/mp4"})
+    s3.upload_file(local_path, R2_BUCKET_NAME, key, ExtraArgs={"ContentType": content_type})
     return f"{R2_PUBLIC_URL}/{key}"
 
 
@@ -89,6 +90,23 @@ def init_db():
             created_at TEXT DEFAULT (datetime('now'))
         )
     """)
+    # Add new columns (safe to call repeatedly)
+    new_columns = [
+        ("thumbnail_url", "TEXT DEFAULT ''"),
+        ("uploader_id", "TEXT DEFAULT ''"),
+        ("uploader_url", "TEXT DEFAULT ''"),
+        ("channel_follower_count", "INTEGER DEFAULT 0"),
+        ("width", "INTEGER DEFAULT 0"),
+        ("height", "INTEGER DEFAULT 0"),
+        ("aspect_ratio", "REAL DEFAULT 0"),
+        ("categories", "TEXT DEFAULT ''"),
+        ("platform", "TEXT DEFAULT ''"),
+    ]
+    for col_name, col_type in new_columns:
+        try:
+            d1_query(f"ALTER TABLE reels ADD COLUMN {col_name} {col_type}")
+        except Exception:
+            pass  # Column already exists
 
 
 def sanitize_filename(name):
@@ -143,18 +161,44 @@ def add_reel():
             tags = info.get("tags", [])
             tags_str = ", ".join(tags) if tags else ""
 
-        # 3. Download
+            # New metadata fields
+            thumbnail = info.get("thumbnail", "")
+            uploader_id = info.get("uploader_id", "") or info.get("channel_id", "") or ""
+            uploader_url = info.get("uploader_url", "") or info.get("channel_url", "") or ""
+            channel_follower_count = int(info.get("channel_follower_count", 0) or 0)
+            width = int(info.get("width", 0) or 0)
+            height = int(info.get("height", 0) or 0)
+            aspect_ratio = round(width / height, 4) if height else 0
+            categories = ", ".join(info.get("categories", []) or [])
+            platform = "tiktok" if "tiktok" in url else "youtube" if "youtube" in url or "youtu.be" in url else "instagram"
+
+        # 3. Download video
         ydl_opts = {"quiet": True, "outtmpl": local_path, "format": "best[ext=mp4]"}
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
 
-        # 4. Upload to R2
+        # 4. Upload video to R2
         public_url = upload_to_r2(local_path, filename)
 
-        # 5. Insert into D1
+        # 5. Download & upload thumbnail to R2
+        thumbnail_url = ""
+        if thumbnail:
+            try:
+                thumb_resp = requests.get(thumbnail, timeout=10)
+                if thumb_resp.status_code == 200:
+                    thumb_path = os.path.join(tempfile.gettempdir(), f"{clean_name}_thumb.jpg")
+                    with open(thumb_path, "wb") as f:
+                        f.write(thumb_resp.content)
+                    thumbnail_url = upload_to_r2(thumb_path, f"thumbs/{clean_name}.jpg", content_type="image/jpeg")
+                    if os.path.exists(thumb_path):
+                        os.remove(thumb_path)
+            except Exception:
+                thumbnail_url = ""
+
+        # 6. Insert into D1
         d1_query(
-            """INSERT INTO reels (url, video_url, title, added_by, language, description, tags, duration, uploader, upload_date, audio, likes, views, comments, shares)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            """INSERT INTO reels (url, video_url, title, added_by, language, description, tags, duration, uploader, upload_date, audio, likes, views, comments, shares, thumbnail_url, uploader_id, uploader_url, channel_follower_count, width, height, aspect_ratio, categories, platform)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             [
                 url,
                 public_url,
@@ -171,6 +215,15 @@ def add_reel():
                 int(info.get("view_count", 0) or 0),
                 int(info.get("comment_count", 0) or 0),
                 int(info.get("repost_count", 0) or 0),
+                thumbnail_url,
+                uploader_id,
+                uploader_url,
+                channel_follower_count,
+                width,
+                height,
+                aspect_ratio,
+                categories,
+                platform,
             ],
         )
 
@@ -205,6 +258,7 @@ def get_library():
         offset = request.args.get("offset", 0, type=int)
         search = request.args.get("search", "").strip()
         language = request.args.get("language", "").strip()
+        platform = request.args.get("platform", "").strip()
         sort = request.args.get("sort", "newest").strip()
 
         clauses = []
@@ -216,6 +270,9 @@ def get_library():
         if language:
             clauses.append("language = ?")
             params.append(language)
+        if platform:
+            clauses.append("platform = ?")
+            params.append(platform)
 
         where = ""
         if clauses:
@@ -250,9 +307,13 @@ def get_stats():
         agg = d1_query("SELECT COALESCE(SUM(likes),0) as total_likes, COALESCE(SUM(views),0) as total_views, COALESCE(SUM(comments),0) as total_comments, COALESCE(SUM(shares),0) as total_shares FROM reels")
         engagement = agg["results"][0] if agg.get("results") else {}
 
+        plat = d1_query("SELECT platform, COUNT(*) as count FROM reels WHERE platform != '' GROUP BY platform ORDER BY count DESC")
+        platforms = plat.get("results", [])
+
         return jsonify({
             "total": total_count,
             "languages": languages,
+            "platforms": platforms,
             "engagement": engagement,
         })
     except Exception as e:
