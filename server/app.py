@@ -22,6 +22,72 @@ R2_PUBLIC_URL = os.environ.get("R2_PUBLIC_URL", "").rstrip("/")
 
 TEAM_PASSWORD = os.environ.get("TEAM_PASSWORD", "malithegoat123")
 
+# --- COOKIES ---
+# Write cookie files from env vars once at startup so yt-dlp can use them.
+YOUTUBE_COOKIE_FILE = None
+INSTAGRAM_COOKIE_FILE = None
+TIKTOK_COOKIE_FILE = None
+
+def _write_cookie_file(env_var, path):
+    content = os.environ.get(env_var, "").strip()
+    if content:
+        with open(path, "w") as f:
+            f.write(content)
+        return path
+    return None
+
+YOUTUBE_COOKIE_FILE   = _write_cookie_file("YOUTUBE_COOKIES",   "/tmp/youtube_cookies.txt")
+INSTAGRAM_COOKIE_FILE = _write_cookie_file("INSTAGRAM_COOKIES", "/tmp/instagram_cookies.txt")
+TIKTOK_COOKIE_FILE    = _write_cookie_file("TIKTOK_COOKIES",    "/tmp/tiktok_cookies.txt")
+
+def get_ydl_opts(platform, extra=None):
+    """Return yt-dlp options with platform-appropriate cookies and headers injected."""
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "no_check_certificates": True,
+        "extractor_retries": 3,
+        "socket_timeout": 30,
+    }
+
+    if platform == "youtube":
+        # Use the iOS player client — bypasses bot/sign-in checks without needing cookies.
+        # Falls back to web_embedded and tv clients if iOS fails.
+        opts["extractor_args"] = {
+            "youtube": {
+                "player_client": ["ios", "web_embedded", "tv_embedded"],
+                "skip": ["dash", "hls"],
+            }
+        }
+        opts["http_headers"] = {
+            "User-Agent": (
+                "com.google.ios.youtube/19.29.1 "
+                "(iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X;)"
+            )
+        }
+        if YOUTUBE_COOKIE_FILE:
+            opts["cookiefile"] = YOUTUBE_COOKIE_FILE
+
+    elif platform == "tiktok":
+        opts["http_headers"] = {
+            "User-Agent": (
+                "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+                "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+                "Version/17.0 Mobile/15E148 Safari/604.1"
+            ),
+            "Referer": "https://www.tiktok.com/",
+        }
+        if TIKTOK_COOKIE_FILE:
+            opts["cookiefile"] = TIKTOK_COOKIE_FILE
+
+    elif platform == "instagram":
+        if INSTAGRAM_COOKIE_FILE:
+            opts["cookiefile"] = INSTAGRAM_COOKIE_FILE
+
+    if extra:
+        opts.update(extra)
+    return opts
+
 # --- D1 HELPER ---
 D1_BASE_URL = f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/d1/database/{D1_DATABASE_ID}/query"
 
@@ -143,8 +209,16 @@ def add_reel():
         if existing.get("results"):
             return jsonify({"status": "exists", "message": "Reel already in vault"}), 200
 
+        # Detect platform early so we can inject the right cookies
+        if "tiktok" in url:
+            platform_early = "tiktok"
+        elif "youtube" in url or "youtu.be" in url:
+            platform_early = "youtube"
+        else:
+            platform_early = "instagram"
+
         # 2. Extract Metadata
-        with yt_dlp.YoutubeDL({"quiet": True}) as ydl:
+        with yt_dlp.YoutubeDL(get_ydl_opts(platform_early)) as ydl:
             info = ydl.extract_info(url, download=False)
 
             actual_title = info.get("title", "Untitled_Reel")
@@ -170,11 +244,26 @@ def add_reel():
             height = int(info.get("height", 0) or 0)
             aspect_ratio = round(width / height, 4) if height else 0
             categories = ", ".join(info.get("categories", []) or [])
-            platform = "tiktok" if "tiktok" in url else "youtube" if "youtube" in url or "youtu.be" in url else "instagram"
+            platform = platform_early
 
         # 3. Download video
-        ydl_opts = {"quiet": True, "outtmpl": local_path, "format": "best[ext=mp4]"}
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        # Format chain: native mp4 first, then any video+audio merge, then absolute best
+        # TikTok and YouTube Shorts often don't have separate streams, so "best" is the safe fallback
+        download_extra = {
+            "outtmpl": local_path,
+            "format": (
+                "bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]"
+                "/bestvideo[ext=mp4]+bestaudio"
+                "/best[ext=mp4]"
+                "/best"
+            ),
+            "merge_output_format": "mp4",
+            "postprocessors": [{
+                "key": "FFmpegVideoConvertor",
+                "preferedformat": "mp4",
+            }],
+        }
+        with yt_dlp.YoutubeDL(get_ydl_opts(platform_early, download_extra)) as ydl:
             ydl.download([url])
 
         # 4. Upload video to R2
@@ -259,7 +348,10 @@ def get_library():
         search = request.args.get("search", "").strip()
         language = request.args.get("language", "").strip()
         platform = request.args.get("platform", "").strip()
-        sort = request.args.get("sort", "newest").strip()
+        added_by = request.args.get("added_by", "").strip()
+        date_range = request.args.get("date_range", "").strip()
+        duration_bucket = request.args.get("duration_bucket", "").strip()
+        sort = request.args.get("sort", "vault_newest").strip()
 
         clauses = []
         params = []
@@ -273,16 +365,42 @@ def get_library():
         if platform:
             clauses.append("platform = ?")
             params.append(platform)
+        if added_by:
+            clauses.append("added_by = ?")
+            params.append(added_by)
+        if date_range == "today":
+            clauses.append("date(created_at) = date('now')")
+        elif date_range == "week":
+            clauses.append("created_at >= datetime('now', '-7 days')")
+        elif date_range == "month":
+            clauses.append("created_at >= datetime('now', '-30 days')")
+
+        if duration_bucket == "short":
+            clauses.append("duration < 15")
+        elif duration_bucket == "medium":
+            clauses.append("duration >= 15 AND duration < 30")
+        elif duration_bucket == "long":
+            clauses.append("duration >= 30 AND duration < 60")
+        elif duration_bucket == "extended":
+            clauses.append("duration >= 60")
 
         where = ""
         if clauses:
             where = "WHERE " + " AND ".join(clauses)
 
         sort_map = {
-            "newest": "id DESC",
-            "oldest": "id ASC",
-            "most_liked": "likes DESC",
-            "most_viewed": "views DESC",
+            "most_liked":     "likes DESC",
+            "most_viewed":    "views DESC",
+            "most_shares":    "shares DESC",
+            "most_comments":  "comments DESC",
+            "longest":        "duration DESC",
+            "shortest":       "duration ASC",
+            "upload_newest":  "upload_date DESC",
+            "upload_oldest":  "upload_date ASC",
+            "vault_newest":   "id DESC",
+            # legacy aliases
+            "newest":         "id DESC",
+            "oldest":         "id ASC",
         }
         order = sort_map.get(sort, "id DESC")
 
@@ -310,10 +428,14 @@ def get_stats():
         plat = d1_query("SELECT platform, COUNT(*) as count FROM reels WHERE platform != '' GROUP BY platform ORDER BY count DESC")
         platforms = plat.get("results", [])
 
+        members = d1_query("SELECT added_by, COUNT(*) as count FROM reels WHERE added_by != '' GROUP BY added_by ORDER BY count DESC")
+        team_members = members.get("results", [])
+
         return jsonify({
             "total": total_count,
             "languages": languages,
             "platforms": platforms,
+            "team_members": team_members,
             "engagement": engagement,
         })
     except Exception as e:
