@@ -1,11 +1,15 @@
 import os
 import re
+import glob
+import json
+import uuid
 import tempfile
 import requests
 import boto3
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import yt_dlp
+from curl_cffi import requests as cffi_requests
 
 app = Flask(__name__)
 CORS(app)
@@ -40,6 +44,217 @@ YOUTUBE_COOKIE_FILE   = _write_cookie_file("YOUTUBE_COOKIES",   "/tmp/youtube_co
 INSTAGRAM_COOKIE_FILE = _write_cookie_file("INSTAGRAM_COOKIES", "/tmp/instagram_cookies.txt")
 TIKTOK_COOKIE_FILE    = _write_cookie_file("TIKTOK_COOKIES",    "/tmp/tiktok_cookies.txt")
 
+
+# --- INSTAGRAM DIRECT SCRAPER (bypasses yt-dlp) ---
+
+# Known doc_ids for Instagram's GraphQL endpoint.  Instagram rotates these
+# every few weeks.  We try each one in order until one works.  To update,
+# set the IG_DOC_ID env var on Render — it will be tried first.
+_GRAPHQL_DOC_IDS = [
+    os.environ.get("IG_DOC_ID", ""),       # custom override (tried first)
+    "10015901848480474",
+    "8845758582119845",
+    "17991233890457762",
+]
+GRAPHQL_DOC_IDS = [d for d in _GRAPHQL_DOC_IDS if d]
+
+CHROME_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/131.0.0.0 Safari/537.36"
+)
+
+def _extract_shortcode(url):
+    """Pull the shortcode from any Instagram reel/post URL."""
+    m = re.search(r'instagram\.com/(?:reels?|p)/([A-Za-z0-9_-]+)', url)
+    return m.group(1) if m else None
+
+
+def _ig_graphql_fetch(shortcode):
+    """Hit Instagram's GraphQL API directly via curl_cffi (Chrome TLS fingerprint).
+    No cookies or login required.  Returns the media dict or raises."""
+    headers = {
+        "User-Agent": CHROME_UA,
+        "Content-Type": "application/x-www-form-urlencoded",
+        "X-IG-App-ID": "936619743392459",
+        "X-FB-LSD": "AVqbxe3J_YA",
+        "X-ASBD-ID": "129477",
+        "Sec-Fetch-Site": "same-origin",
+        "Referer": "https://www.instagram.com/",
+        "Origin": "https://www.instagram.com",
+    }
+    variables = json.dumps({"shortcode": shortcode}, separators=(",", ":"))
+
+    last_err = None
+    for doc_id in GRAPHQL_DOC_IDS:
+        try:
+            data = f"variables={variables}&doc_id={doc_id}&lsd=AVqbxe3J_YA"
+            resp = cffi_requests.post(
+                "https://www.instagram.com/api/graphql",
+                headers=headers,
+                data=data,
+                impersonate="chrome131",
+                timeout=20,
+            )
+            if resp.status_code != 200:
+                last_err = f"GraphQL returned {resp.status_code}"
+                continue
+            body = resp.json()
+            media = (body.get("data", {}).get("xdt_shortcode_media")
+                     or body.get("data", {}).get("shortcode_media"))
+            if media and media.get("video_url"):
+                return media
+            last_err = "GraphQL returned no video data"
+        except Exception as e:
+            last_err = str(e)
+            continue
+
+    raise Exception(f"Instagram GraphQL failed: {last_err}")
+
+
+def _ig_api_fallback(shortcode):
+    """Fallback: try the ?__a=1&__d=dis JSON endpoint (needs cookies)."""
+    if not INSTAGRAM_COOKIE_FILE:
+        raise Exception("No Instagram cookies configured for fallback")
+
+    with open(INSTAGRAM_COOKIE_FILE) as f:
+        cookie_text = f.read()
+
+    # Parse Netscape cookie file into a dict
+    cookies = {}
+    for line in cookie_text.splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            parts = line.split("\t")
+            if len(parts) >= 7:
+                cookies[parts[5]] = parts[6]
+
+    headers = {
+        "User-Agent": CHROME_UA,
+        "X-IG-App-ID": "936619743392459",
+        "Referer": "https://www.instagram.com/",
+    }
+
+    resp = cffi_requests.get(
+        f"https://www.instagram.com/p/{shortcode}/?__a=1&__d=dis",
+        headers=headers,
+        cookies=cookies,
+        impersonate="chrome131",
+        timeout=20,
+    )
+    if resp.status_code != 200:
+        raise Exception(f"Instagram API returned {resp.status_code}")
+
+    body = resp.json()
+    items = body.get("items") or body.get("graphql", {}).get("shortcode_media")
+    if isinstance(items, list) and items:
+        return items[0]
+    if isinstance(items, dict):
+        return items
+    raise Exception("Instagram API returned no media data")
+
+
+def fetch_instagram_reel(url):
+    """Fetch Instagram reel metadata + direct video URL.
+    Layer 1: GraphQL API (no auth)  →  Layer 2: ?__a=1 endpoint (cookies)
+    Returns a normalized info dict matching the shape the rest of add_reel expects."""
+    shortcode = _extract_shortcode(url)
+    if not shortcode:
+        raise Exception("Could not extract shortcode from Instagram URL")
+
+    media = None
+    errors = []
+
+    # Layer 1: GraphQL (no auth needed)
+    try:
+        media = _ig_graphql_fetch(shortcode)
+    except Exception as e:
+        errors.append(f"GraphQL: {e}")
+
+    # Layer 2: ?__a=1 fallback (uses cookies if available)
+    if not media:
+        try:
+            media = _ig_api_fallback(shortcode)
+        except Exception as e:
+            errors.append(f"API fallback: {e}")
+
+    if not media:
+        raise Exception(
+            "All Instagram extraction methods failed. "
+            + " | ".join(errors)
+        )
+
+    # Normalize into the shape add_reel expects
+    video_url = media.get("video_url", "")
+    if not video_url:
+        # Try video_versions array (private API format)
+        versions = media.get("video_versions", [])
+        if versions:
+            video_url = versions[0].get("url", "")
+
+    if not video_url:
+        raise Exception("Instagram returned media but no video URL — post may be an image")
+
+    # Extract caption
+    caption = ""
+    edges = media.get("edge_media_to_caption", {}).get("edges", [])
+    if edges:
+        caption = edges[0].get("node", {}).get("text", "")
+    elif media.get("caption"):
+        cap = media["caption"]
+        caption = cap.get("text", "") if isinstance(cap, dict) else str(cap)
+
+    # Extract uploader
+    owner = media.get("owner", {})
+    uploader = owner.get("username") or owner.get("full_name") or "Unknown"
+    uploader_id = owner.get("id", "")
+    uploader_url = f"https://www.instagram.com/{uploader}/" if uploader != "Unknown" else ""
+
+    # Dimensions
+    dims = media.get("dimensions", {})
+    width = int(dims.get("width", 0) or media.get("original_width", 0) or 0)
+    height = int(dims.get("height", 0) or media.get("original_height", 0) or 0)
+
+    # Thumbnail
+    thumbnail = (media.get("display_url")
+                 or media.get("thumbnail_src")
+                 or media.get("image_versions2", {}).get("candidates", [{}])[0].get("url", ""))
+
+    duration = 0
+    raw_dur = media.get("video_duration")
+    if raw_dur:
+        duration = int(float(raw_dur))
+
+    return {
+        "video_download_url": video_url,
+        "title": (caption[:80] + "...") if len(caption) > 80 else caption or "Untitled Reel",
+        "id": shortcode,
+        "uploader": uploader,
+        "uploader_id": uploader_id,
+        "uploader_url": uploader_url,
+        "duration": duration,
+        "description": caption,
+        "upload_date": "",
+        "track": "Original Audio",
+        "tags": [],
+        "thumbnail": thumbnail,
+        "channel_follower_count": int(owner.get("edge_followed_by", {}).get("count", 0) or 0),
+        "width": width,
+        "height": height,
+        "categories": [],
+        "like_count": int(media.get("edge_media_preview_like", {}).get("count", 0)
+                         or media.get("like_count", 0) or 0),
+        "view_count": int(media.get("video_play_count", 0)
+                         or media.get("video_view_count", 0)
+                         or media.get("play_count", 0) or 0),
+        "comment_count": int(media.get("edge_media_to_parent_comment", {}).get("count", 0)
+                             or media.get("comment_count", 0) or 0),
+        "repost_count": 0,
+    }
+
+
+# --- YT-DLP OPTIONS (YouTube + TikTok) ---
+
 def get_ydl_opts(platform, extra=None):
     """Return yt-dlp options with platform-appropriate cookies and headers injected."""
     opts = {
@@ -51,20 +266,6 @@ def get_ydl_opts(platform, extra=None):
     }
 
     if platform == "youtube":
-        # Use the iOS player client — bypasses bot/sign-in checks without needing cookies.
-        # Falls back to web_embedded and tv clients if iOS fails.
-        opts["extractor_args"] = {
-            "youtube": {
-                "player_client": ["ios", "web_embedded", "tv_embedded"],
-                "skip": ["dash", "hls"],
-            }
-        }
-        opts["http_headers"] = {
-            "User-Agent": (
-                "com.google.ios.youtube/19.29.1 "
-                "(iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X;)"
-            )
-        }
         if YOUTUBE_COOKIE_FILE:
             opts["cookiefile"] = YOUTUBE_COOKIE_FILE
 
@@ -79,10 +280,6 @@ def get_ydl_opts(platform, extra=None):
         }
         if TIKTOK_COOKIE_FILE:
             opts["cookiefile"] = TIKTOK_COOKIE_FILE
-
-    elif platform == "instagram":
-        if INSTAGRAM_COOKIE_FILE:
-            opts["cookiefile"] = INSTAGRAM_COOKIE_FILE
 
     if extra:
         opts.update(extra)
@@ -193,6 +390,16 @@ def login():
     return jsonify({"error": "Unauthorized"}), 401
 
 
+@app.route("/cookie_status", methods=["GET"])
+def cookie_status():
+    """Check which platform cookies are configured."""
+    return jsonify({
+        "youtube": YOUTUBE_COOKIE_FILE is not None,
+        "instagram": INSTAGRAM_COOKIE_FILE is not None,
+        "tiktok": TIKTOK_COOKIE_FILE is not None,
+    })
+
+
 @app.route("/add_reel", methods=["POST"])
 def add_reel():
     data = request.json
@@ -209,7 +416,7 @@ def add_reel():
         if existing.get("results"):
             return jsonify({"status": "exists", "message": "Reel already in vault"}), 200
 
-        # Detect platform early so we can inject the right cookies
+        # Detect platform
         if "tiktok" in url:
             platform_early = "tiktok"
         elif "youtube" in url or "youtu.be" in url:
@@ -217,14 +424,109 @@ def add_reel():
         else:
             platform_early = "instagram"
 
+        # --- INSTAGRAM: direct GraphQL scraper (no yt-dlp) ---
+        if platform_early == "instagram":
+            info = fetch_instagram_reel(url)
+            video_download_url = info["video_download_url"]
+            video_id = info["id"]
+            r2_key = f"instagram_{video_id}.mp4"
+            local_path = f"/tmp/{r2_key}"
+
+            # Download video directly from Instagram CDN via curl_cffi
+            vid_resp = cffi_requests.get(
+                video_download_url,
+                headers={"User-Agent": CHROME_UA, "Referer": "https://www.instagram.com/"},
+                impersonate="chrome131",
+                timeout=60,
+            )
+            if vid_resp.status_code != 200:
+                raise Exception(f"Failed to download video: HTTP {vid_resp.status_code}")
+            with open(local_path, "wb") as f:
+                f.write(vid_resp.content)
+
+            if os.path.getsize(local_path) < 1000:
+                os.remove(local_path)
+                raise Exception("Downloaded file is too small — Instagram may have blocked the request")
+
+            # Upload video to R2
+            public_url = upload_to_r2(local_path, r2_key)
+
+            # Download & upload thumbnail
+            thumbnail_url = ""
+            thumbnail = info.get("thumbnail", "")
+            if thumbnail:
+                try:
+                    thumb_resp = cffi_requests.get(
+                        thumbnail,
+                        headers={"User-Agent": CHROME_UA},
+                        impersonate="chrome131",
+                        timeout=10,
+                    )
+                    if thumb_resp.status_code == 200:
+                        thumb_path = f"/tmp/instagram_{video_id}_thumb.jpg"
+                        with open(thumb_path, "wb") as f:
+                            f.write(thumb_resp.content)
+                        thumbnail_url = upload_to_r2(thumb_path, f"thumbs/instagram_{video_id}.jpg", content_type="image/jpeg")
+                        if os.path.exists(thumb_path):
+                            os.remove(thumb_path)
+                except Exception:
+                    thumbnail_url = ""
+
+            # Metadata
+            uploader = info.get("uploader", "Unknown")
+            duration = info.get("duration", 0)
+            description = info.get("description", "")
+            tags = info.get("tags", [])
+            tags_str = ", ".join(tags) if tags else ""
+            width = info.get("width", 0)
+            height = info.get("height", 0)
+            aspect_ratio = round(width / height, 4) if height else 0
+
+            # Insert into D1
+            d1_query(
+                """INSERT INTO reels (url, video_url, title, added_by, language, description, tags, duration, uploader, upload_date, audio, likes, views, comments, shares, thumbnail_url, uploader_id, uploader_url, channel_follower_count, width, height, aspect_ratio, categories, platform)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                [
+                    url,
+                    public_url,
+                    info.get("title", "Untitled Reel"),
+                    username,
+                    language,
+                    description,
+                    tags_str,
+                    duration,
+                    uploader,
+                    info.get("upload_date", ""),
+                    info.get("track", "Original Audio"),
+                    int(info.get("like_count", 0) or 0),
+                    int(info.get("view_count", 0) or 0),
+                    int(info.get("comment_count", 0) or 0),
+                    int(info.get("repost_count", 0) or 0),
+                    thumbnail_url,
+                    info.get("uploader_id", ""),
+                    info.get("uploader_url", ""),
+                    int(info.get("channel_follower_count", 0) or 0),
+                    width,
+                    height,
+                    aspect_ratio,
+                    ", ".join(info.get("categories", []) or []),
+                    "instagram",
+                ],
+            )
+
+            if os.path.exists(local_path):
+                os.remove(local_path)
+            return jsonify({"status": "success", "file": r2_key})
+
+        # --- YOUTUBE / TIKTOK: use yt-dlp ---
         # 2. Extract Metadata
         with yt_dlp.YoutubeDL(get_ydl_opts(platform_early)) as ydl:
             info = ydl.extract_info(url, download=False)
 
             actual_title = info.get("title", "Untitled_Reel")
-            clean_name = sanitize_filename(actual_title)
-            filename = f"{clean_name}.mp4"
-            local_path = f"/tmp/{filename}"
+            video_id = info.get("id") or uuid.uuid4().hex[:12]
+            r2_key = f"{platform_early}_{video_id}.mp4"
+            local_path = f"/tmp/{r2_key}"
 
             uploader = info.get("uploader") or info.get("channel") or "Unknown"
             raw_duration = info.get("duration", 0)
@@ -235,7 +537,6 @@ def add_reel():
             tags = info.get("tags", [])
             tags_str = ", ".join(tags) if tags else ""
 
-            # New metadata fields
             thumbnail = info.get("thumbnail", "")
             uploader_id = info.get("uploader_id", "") or info.get("channel_id", "") or ""
             uploader_url = info.get("uploader_url", "") or info.get("channel_url", "") or ""
@@ -247,8 +548,6 @@ def add_reel():
             platform = platform_early
 
         # 3. Download video
-        # Format chain: native mp4 first, then any video+audio merge, then absolute best
-        # TikTok and YouTube Shorts often don't have separate streams, so "best" is the safe fallback
         download_extra = {
             "outtmpl": local_path,
             "format": (
@@ -266,8 +565,15 @@ def add_reel():
         with yt_dlp.YoutubeDL(get_ydl_opts(platform_early, download_extra)) as ydl:
             ydl.download([url])
 
+        if not os.path.exists(local_path):
+            candidates = glob.glob(f"/tmp/{platform_early}_{video_id}.*")
+            if candidates:
+                local_path = candidates[0]
+            else:
+                raise Exception("Download completed but output file not found")
+
         # 4. Upload video to R2
-        public_url = upload_to_r2(local_path, filename)
+        public_url = upload_to_r2(local_path, r2_key)
 
         # 5. Download & upload thumbnail to R2
         thumbnail_url = ""
@@ -275,10 +581,10 @@ def add_reel():
             try:
                 thumb_resp = requests.get(thumbnail, timeout=10)
                 if thumb_resp.status_code == 200:
-                    thumb_path = os.path.join(tempfile.gettempdir(), f"{clean_name}_thumb.jpg")
+                    thumb_path = os.path.join(tempfile.gettempdir(), f"{platform_early}_{video_id}_thumb.jpg")
                     with open(thumb_path, "wb") as f:
                         f.write(thumb_resp.content)
-                    thumbnail_url = upload_to_r2(thumb_path, f"thumbs/{clean_name}.jpg", content_type="image/jpeg")
+                    thumbnail_url = upload_to_r2(thumb_path, f"thumbs/{platform_early}_{video_id}.jpg", content_type="image/jpeg")
                     if os.path.exists(thumb_path):
                         os.remove(thumb_path)
             except Exception:
@@ -318,21 +624,31 @@ def add_reel():
 
         if os.path.exists(local_path):
             os.remove(local_path)
-        return jsonify({"status": "success", "file": filename})
+        return jsonify({"status": "success", "file": r2_key})
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        err = str(e)
+        if "Sign in to confirm" in err or "bot" in err.lower():
+            cookie_var = "YOUTUBE_COOKIES" if platform_early == "youtube" else f"{platform_early.upper()}_COOKIES"
+            err = f"[{platform_early}] Blocked by bot detection. Set the {cookie_var} env var in Render with exported browser cookies."
+        elif "not available" in err.lower() and platform_early == "tiktok":
+            err = "TikTok blocked this request. Set the TIKTOK_COOKIES env var in Render with exported browser cookies."
+        return jsonify({"error": err}), 500
 
 
 @app.route("/delete_reel", methods=["POST"])
 def delete_reel():
     reel_id = request.json.get("id")
     try:
-        record = d1_query("SELECT video_url FROM reels WHERE id = ?", [reel_id])
+        record = d1_query("SELECT video_url, thumbnail_url FROM reels WHERE id = ?", [reel_id])
         if record.get("results"):
-            video_url = record["results"][0]["video_url"]
-            filename = video_url.split("/")[-1]
-            delete_from_r2(filename)
+            row = record["results"][0]
+            video_url = row.get("video_url", "")
+            thumbnail_url = row.get("thumbnail_url", "")
+            if video_url:
+                delete_from_r2(video_url.split("/")[-1])
+            if thumbnail_url and "/thumbs/" in thumbnail_url:
+                delete_from_r2("thumbs/" + thumbnail_url.split("/thumbs/")[-1])
 
         d1_query("DELETE FROM reels WHERE id = ?", [reel_id])
         return jsonify({"status": "deleted"}), 200

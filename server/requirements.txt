@@ -1,6 +1,7 @@
 flask
 flask-cors
-yt-dlp
+yt-dlp[default,curl-cffi]>=2026.02.21
 gunicorn
 requests
 boto3
+curl_cffi
