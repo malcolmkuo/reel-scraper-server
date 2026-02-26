@@ -720,11 +720,14 @@ def get_library():
         }
         order = sort_map.get(sort, "id DESC")
 
-        sql = f"SELECT * FROM reels {where} ORDER BY {order} LIMIT ? OFFSET ?"
+        sql = f"SELECT *, COUNT(*) OVER() AS _total FROM reels {where} ORDER BY {order} LIMIT ? OFFSET ?"
         params.extend([limit, offset])
 
         result = d1_query(sql, params)
-        return jsonify(result.get("results", []))
+        rows = result.get("results", [])
+        total = rows[0]["_total"] if rows else 0
+        clean_rows = [{k: v for k, v in row.items() if k != "_total"} for row in rows]
+        return jsonify({"results": clean_rows, "total": total})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
