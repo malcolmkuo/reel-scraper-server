@@ -719,10 +719,17 @@ def delete_reel():
             row = record["results"][0]
             video_url = row.get("video_url", "")
             thumbnail_url = row.get("thumbnail_url", "")
+            # R2 deletions are best-effort — never let them block the D1 deletion
             if video_url:
-                delete_from_r2(video_url.split("/")[-1])
+                try:
+                    delete_from_r2(video_url.split("/")[-1])
+                except Exception:
+                    pass
             if thumbnail_url and "/thumbs/" in thumbnail_url:
-                delete_from_r2("thumbs/" + thumbnail_url.split("/thumbs/")[-1])
+                try:
+                    delete_from_r2("thumbs/" + thumbnail_url.split("/thumbs/")[-1])
+                except Exception:
+                    pass
 
         d1_query("DELETE FROM reels WHERE id = ?", [reel_id])
         return jsonify({"status": "deleted"}), 200
