@@ -4,6 +4,7 @@ import glob
 import json
 import uuid
 import tempfile
+import threading
 import requests
 import boto3
 from flask import Flask, request, jsonify
@@ -377,44 +378,21 @@ def sanitize_filename(name):
     return clean.replace(" ", "_")
 
 
-# --- ROUTES ---
-@app.route("/")
-def home():
-    return "Reel Vault Engine Online"
+# --- BATCH JOB TRACKING ---
+_jobs = {}
+_jobs_lock = threading.Lock()
 
 
-@app.route("/login", methods=["POST"])
-def login():
-    if request.json.get("password") == TEAM_PASSWORD:
-        return jsonify({"status": "success"}), 200
-    return jsonify({"error": "Unauthorized"}), 401
+# --- CORE URL PROCESSING (shared by /add_reel and /batch_add) ---
 
-
-@app.route("/cookie_status", methods=["GET"])
-def cookie_status():
-    """Check which platform cookies are configured."""
-    return jsonify({
-        "youtube": YOUTUBE_COOKIE_FILE is not None,
-        "instagram": INSTAGRAM_COOKIE_FILE is not None,
-        "tiktok": TIKTOK_COOKIE_FILE is not None,
-    })
-
-
-@app.route("/add_reel", methods=["POST"])
-def add_reel():
-    data = request.json
-    url = data.get("url")
-    username = data.get("username", "Anonymous")
-    language = data.get("language", "English")
-
-    if not url:
-        return jsonify({"error": "No URL provided"}), 400
-
+def _process_url(url, username, language):
+    """Download, upload, and insert a single video URL. Returns {status, file?, error?}."""
+    platform_early = "unknown"
     try:
         # 1. Check Duplicates
         existing = d1_query("SELECT id FROM reels WHERE url = ?", [url])
         if existing.get("results"):
-            return jsonify({"status": "exists", "message": "Reel already in vault"}), 200
+            return {"status": "exists"}
 
         # Detect platform
         if "tiktok" in url:
@@ -516,7 +494,7 @@ def add_reel():
 
             if os.path.exists(local_path):
                 os.remove(local_path)
-            return jsonify({"status": "success", "file": r2_key})
+            return {"status": "success", "file": r2_key}
 
         # --- YOUTUBE / TIKTOK: use yt-dlp ---
         # 2. Extract Metadata
@@ -624,7 +602,7 @@ def add_reel():
 
         if os.path.exists(local_path):
             os.remove(local_path)
-        return jsonify({"status": "success", "file": r2_key})
+        return {"status": "success", "file": r2_key}
 
     except Exception as e:
         err = str(e)
@@ -633,7 +611,103 @@ def add_reel():
             err = f"[{platform_early}] Blocked by bot detection. Set the {cookie_var} env var in Render with exported browser cookies."
         elif "not available" in err.lower() and platform_early == "tiktok":
             err = "TikTok blocked this request. Set the TIKTOK_COOKIES env var in Render with exported browser cookies."
-        return jsonify({"error": err}), 500
+        return {"status": "error", "error": err}
+
+
+# --- ROUTES ---
+@app.route("/")
+def home():
+    return "Reel Vault Engine Online"
+
+
+@app.route("/login", methods=["POST"])
+def login():
+    if request.json.get("password") == TEAM_PASSWORD:
+        return jsonify({"status": "success"}), 200
+    return jsonify({"error": "Unauthorized"}), 401
+
+
+@app.route("/cookie_status", methods=["GET"])
+def cookie_status():
+    """Check which platform cookies are configured."""
+    return jsonify({
+        "youtube": YOUTUBE_COOKIE_FILE is not None,
+        "instagram": INSTAGRAM_COOKIE_FILE is not None,
+        "tiktok": TIKTOK_COOKIE_FILE is not None,
+    })
+
+
+@app.route("/add_reel", methods=["POST"])
+def add_reel():
+    data = request.json
+    url = data.get("url")
+    username = data.get("username", "Anonymous")
+    language = data.get("language", "English")
+
+    if not url:
+        return jsonify({"error": "No URL provided"}), 400
+
+    result = _process_url(url, username, language)
+
+    if result["status"] == "exists":
+        return jsonify({"status": "exists", "message": "Reel already in vault"}), 200
+    elif result["status"] == "success":
+        return jsonify({"status": "success", "file": result.get("file")}), 200
+    else:
+        return jsonify({"error": result.get("error", "Unknown error")}), 500
+
+
+@app.route("/batch_add", methods=["POST"])
+def batch_add():
+    """Accept a list of URLs and process them sequentially in a background thread.
+    Returns a job_id to poll with /batch_status."""
+    data = request.json
+    urls = data.get("urls", [])
+    username = data.get("username", "Anonymous")
+    language = data.get("language", "English")
+
+    if not urls:
+        return jsonify({"error": "No URLs provided"}), 400
+
+    job_id = uuid.uuid4().hex[:12]
+    with _jobs_lock:
+        _jobs[job_id] = {
+            "status": "running",
+            "total": len(urls),
+            "done": 0,
+            "results": [],
+        }
+
+    def run_batch():
+        for url in urls:
+            result = _process_url(url, username, language)
+            with _jobs_lock:
+                _jobs[job_id]["results"].append({"url": url, **result})
+                _jobs[job_id]["done"] += 1
+        with _jobs_lock:
+            _jobs[job_id]["status"] = "done"
+
+    threading.Thread(target=run_batch, daemon=True).start()
+    return jsonify({"job_id": job_id})
+
+
+@app.route("/batch_status", methods=["GET"])
+def batch_status():
+    """Return the current state of a batch job."""
+    job_id = request.args.get("job_id")
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+    if not job:
+        return jsonify({"error": "Job not found"}), 404
+    # Return a snapshot copy to avoid holding the lock during serialization
+    with _jobs_lock:
+        snapshot = {
+            "status": job["status"],
+            "total": job["total"],
+            "done": job["done"],
+            "results": list(job["results"]),
+        }
+    return jsonify(snapshot)
 
 
 @app.route("/delete_reel", methods=["POST"])
@@ -773,4 +847,4 @@ with app.app_context():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=port, threaded=True)
