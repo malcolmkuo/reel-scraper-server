@@ -267,6 +267,8 @@ def get_ydl_opts(platform, extra=None):
     }
 
     if platform == "youtube":
+        opts["http_headers"] = {"User-Agent": CHROME_UA}
+        opts["extractor_args"] = {"youtube": {"player_client": ["ios", "web"]}}
         if YOUTUBE_COOKIE_FILE:
             opts["cookiefile"] = YOUTUBE_COOKIE_FILE
 
@@ -307,6 +309,19 @@ def d1_query(sql, params=None):
         errors = data.get("errors", [])
         raise Exception(f"D1 query failed: {errors}")
     return data["result"][0]
+
+
+# --- LANGUAGE CODE MAPPING ---
+LANG_TO_CODE = {
+    "english": "en",
+    "spanish": "es",
+    "french":  "fr",
+    "chinese": "zh",
+    "other":   "other",
+}
+
+def lang_code(language):
+    return LANG_TO_CODE.get((language or "other").lower(), "other")
 
 
 # --- R2 HELPERS ---
@@ -407,8 +422,8 @@ def _process_url(url, username, language):
             info = fetch_instagram_reel(url)
             video_download_url = info["video_download_url"]
             video_id = info["id"]
-            r2_key = f"instagram_{video_id}.mp4"
-            local_path = f"/tmp/{r2_key}"
+            r2_key = f"{lang_code(language)}/instagram_{video_id}.mp4"
+            local_path = f"/tmp/instagram_{video_id}.mp4"
 
             # Download video directly from Instagram CDN via curl_cffi
             vid_resp = cffi_requests.get(
@@ -444,7 +459,7 @@ def _process_url(url, username, language):
                         thumb_path = f"/tmp/instagram_{video_id}_thumb.jpg"
                         with open(thumb_path, "wb") as f:
                             f.write(thumb_resp.content)
-                        thumbnail_url = upload_to_r2(thumb_path, f"thumbs/instagram_{video_id}.jpg", content_type="image/jpeg")
+                        thumbnail_url = upload_to_r2(thumb_path, f"{lang_code(language)}/thumbs/instagram_{video_id}.jpg", content_type="image/jpeg")
                         if os.path.exists(thumb_path):
                             os.remove(thumb_path)
                 except Exception:
@@ -503,8 +518,8 @@ def _process_url(url, username, language):
 
             actual_title = info.get("title", "Untitled_Reel")
             video_id = info.get("id") or uuid.uuid4().hex[:12]
-            r2_key = f"{platform_early}_{video_id}.mp4"
-            local_path = f"/tmp/{r2_key}"
+            r2_key = f"{lang_code(language)}/{platform_early}_{video_id}.mp4"
+            local_path = f"/tmp/{platform_early}_{video_id}.mp4"
 
             uploader = info.get("uploader") or info.get("channel") or "Unknown"
             raw_duration = info.get("duration", 0)
@@ -562,7 +577,7 @@ def _process_url(url, username, language):
                     thumb_path = os.path.join(tempfile.gettempdir(), f"{platform_early}_{video_id}_thumb.jpg")
                     with open(thumb_path, "wb") as f:
                         f.write(thumb_resp.content)
-                    thumbnail_url = upload_to_r2(thumb_path, f"thumbs/{platform_early}_{video_id}.jpg", content_type="image/jpeg")
+                    thumbnail_url = upload_to_r2(thumb_path, f"{lang_code(language)}/thumbs/{platform_early}_{video_id}.jpg", content_type="image/jpeg")
                     if os.path.exists(thumb_path):
                         os.remove(thumb_path)
             except Exception:
@@ -720,14 +735,14 @@ def delete_reel():
             video_url = row.get("video_url", "")
             thumbnail_url = row.get("thumbnail_url", "")
             # R2 deletions are best-effort — never let them block the D1 deletion
-            if video_url:
+            if video_url and video_url.startswith(R2_PUBLIC_URL + "/"):
                 try:
-                    delete_from_r2(video_url.split("/")[-1])
+                    delete_from_r2(video_url[len(R2_PUBLIC_URL) + 1:])
                 except Exception:
                     pass
-            if thumbnail_url and "/thumbs/" in thumbnail_url:
+            if thumbnail_url and thumbnail_url.startswith(R2_PUBLIC_URL + "/"):
                 try:
-                    delete_from_r2("thumbs/" + thumbnail_url.split("/thumbs/")[-1])
+                    delete_from_r2(thumbnail_url[len(R2_PUBLIC_URL) + 1:])
                 except Exception:
                     pass
 
